@@ -84,6 +84,14 @@ enum ClusterForwardingClient {
         // which call `S3Service.authenticate...` before ever consulting `ObjectRoutingService`)
         // would fail signature verification if this changed to the peer's own host:port -
         // forwarding must replay the exact bytes the client signed, just to a different socket.
+        //
+        // `content-length` is a *signed* header for aws-sdk-go clients (rclone, and thus TrueNAS
+        // cloud sync), so the peer must see the same value to reproduce the canonical request.
+        // We capture it here and re-emit it by streaming the body with a *known* length below
+        // (an unknown length switches to chunked Transfer-Encoding and drops `Content-Length`,
+        // which broke signature verification on every forwarded-to node - see issue #22). It's
+        // removed now only so AsyncHTTPClient re-adds a single canonical copy from the length.
+        let signedContentLength = req.headers.first(name: .contentLength).flatMap(Int64.init)
         outbound.headers.remove(name: .contentLength)
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
@@ -118,7 +126,12 @@ enum ClusterForwardingClient {
                     continuation.finish(throwing: error)
                 }
             }
-            outbound.body = .stream(bridged, length: .unknown)
+            // Known length preserves the signed `Content-Length` header (see above); fall back to
+            // an unknown (chunked) length only when the client sent no `Content-Length` at all -
+            // in which case it could not have signed one either.
+            let length: HTTPClientRequest.Body.Length =
+                signedContentLength.map { .known($0) } ?? .unknown
+            outbound.body = .stream(bridged, length: length)
         }
 
         let client = req.application.http.client.shared

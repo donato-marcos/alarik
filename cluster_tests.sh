@@ -400,6 +400,58 @@ else
     fi
 fi
 
+# ── Test 3b: WRITE-forward with a content-length-signing client (issue #22) ──
+# aws-sdk-go clients (rclone, and thus TrueNAS cloud sync) include `content-length` in their
+# SigV4 SignedHeaders. A body-carrying PUT forwarded to a non-responsible node used to have that
+# header stripped in transit, so the receiving node's signature re-check failed with 403
+# SignatureDoesNotMatch. botocore (the `aws` CLI used everywhere else here) does NOT sign
+# content-length, which is exactly why only rclone-style clients hit it - so reproducing this
+# specifically needs rclone.
+echo ""
+echo "=== Test: write-forward with content-length-signing client (rclone, issue #22) ==="
+if ! command -v rclone >/dev/null 2>&1; then
+    echo "SKIP: rclone not installed - cannot reproduce the aws-sdk-go content-length signing path."
+else
+    RCLONE_CFG=$(mktemp)
+    cat >"$RCLONE_CFG" <<EOF
+[alarik]
+type = s3
+provider = Other
+access_key_id = $ACCESS_KEY
+secret_access_key = $SECRET_KEY
+region = us-east-1
+force_path_style = true
+EOF
+    RF_KEY="rclone-forward.txt"
+    # Create the object first so its placement is known, then overwrite it THROUGH a node that is
+    # NOT responsible for it - guaranteeing the write is proxy-forwarded to a peer.
+    rclone --config "$RCLONE_CFG" --s3-endpoint "${ENDPOINTS[0]}" \
+        copyto "$CONTENT_FILE" "alarik:cluster-test/$RF_KEY" >/dev/null 2>&1
+
+    RF_PLACEMENT=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=cluster-test" -H "Authorization: Bearer $TOKEN")
+    RF_RESPONSIBLE_IDS=$(echo "$RF_PLACEMENT" | jq -r ".items[] | select(.key == \"$RF_KEY\") | .nodeIds[]")
+    RF_NON_RESPONSIBLE_ENDPOINT=""
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        NODE_ID=$(echo "$NODES_RESP" | jq -r ".[$i].id")
+        if ! echo "$RF_RESPONSIBLE_IDS" | grep -q "^$NODE_ID$"; then
+            RF_NON_RESPONSIBLE_ENDPOINT="${ENDPOINTS[$i]}"
+            break
+        fi
+    done
+
+    if [ -z "$RF_NON_RESPONSIBLE_ENDPOINT" ]; then
+        fail "Could not find a node not responsible for $RF_KEY (unexpected with $NODE_COUNT nodes / factor 3)."
+    elif ! rclone --config "$RCLONE_CFG" --s3-endpoint "$RF_NON_RESPONSIBLE_ENDPOINT" \
+        copyto "$CONTENT_FILE" "alarik:cluster-test/$RF_KEY" >/dev/null 2>&1; then
+        fail "rclone PUT forwarded to a non-responsible node failed (issue #22 - content-length stripped in forward)."
+    elif aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "s3://cluster-test/$RF_KEY" - 2>/dev/null | cmp -s - "$CONTENT_FILE"; then
+        pass "rclone write forwarded to a non-responsible node succeeds with correct bytes (issue #22)."
+    else
+        fail "Forwarded rclone write did not store the correct object bytes."
+    fi
+    rm -f "$RCLONE_CFG"
+fi
+
 # ── Test 4: DELETE propagates to every node ─────────────────────────────────
 echo ""
 echo "=== Test: cross-node DELETE ==="
