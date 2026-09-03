@@ -110,12 +110,17 @@ enum ReedSolomonEngine {
         var dataPointers = dataBuffers.map { $0.pointer as UnsafeMutablePointer<UInt8>? }
         var codingPointers = parityBuffers.map { $0.pointer as UnsafeMutablePointer<UInt8>? }
 
-        dataPointers.withUnsafeMutableBufferPointer { dataBuf in
-            codingPointers.withUnsafeMutableBufferPointer { codingBuf in
-                gftbls.withUnsafeMutableBufferPointer { tblBuf in
-                    ec_encode_data(
-                        Int32(len), Int32(k), Int32(m), tblBuf.baseAddress,
-                        dataBuf.baseAddress, codingBuf.baseAddress)
+        // Pin the ShardBuffers across the C call: they aren't named below, so an optimized build's
+        // ARC can free them (via deinit) while `ec_encode_data` still uses their pointers - a
+        // release-only use-after-free that corrupts the heap and garbles parity (issue #24).
+        withExtendedLifetime((dataBuffers, parityBuffers)) {
+            dataPointers.withUnsafeMutableBufferPointer { dataBuf in
+                codingPointers.withUnsafeMutableBufferPointer { codingBuf in
+                    gftbls.withUnsafeMutableBufferPointer { tblBuf in
+                        ec_encode_data(
+                            Int32(len), Int32(k), Int32(m), tblBuf.baseAddress,
+                            dataBuf.baseAddress, codingBuf.baseAddress)
+                    }
                 }
             }
         }
@@ -209,12 +214,15 @@ enum ReedSolomonEngine {
         var sourcePointers = sourceBuffers.map { $0.pointer as UnsafeMutablePointer<UInt8>? }
         var outputPointers = outputBuffers.map { $0.pointer as UnsafeMutablePointer<UInt8>? }
 
-        sourcePointers.withUnsafeMutableBufferPointer { srcBuf in
-            outputPointers.withUnsafeMutableBufferPointer { outBuf in
-                gftbls.withUnsafeMutableBufferPointer { tblBuf in
-                    ec_encode_data(
-                        Int32(len), Int32(k), Int32(p), tblBuf.baseAddress,
-                        srcBuf.baseAddress, outBuf.baseAddress)
+        // Same ARC use-after-free hazard as `encode` - pin the ShardBuffers across the C call.
+        withExtendedLifetime((sourceBuffers, outputBuffers)) {
+            sourcePointers.withUnsafeMutableBufferPointer { srcBuf in
+                outputPointers.withUnsafeMutableBufferPointer { outBuf in
+                    gftbls.withUnsafeMutableBufferPointer { tblBuf in
+                        ec_encode_data(
+                            Int32(len), Int32(k), Int32(p), tblBuf.baseAddress,
+                            srcBuf.baseAddress, outBuf.baseAddress)
+                    }
                 }
             }
         }
